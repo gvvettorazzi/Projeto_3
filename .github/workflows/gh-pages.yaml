@@ -2,7 +2,8 @@ name: GitHub Pages
 
 on:
   push:
-    branches: ['master']
+    branches:
+      - 'master'
 
 jobs:
   pages:
@@ -13,12 +14,14 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup PHP
-        uses: shivammathur/setup-php@v2
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
         with:
-          php-version: 8.3
+          php-version: '8.3'
           coverage: none
 
       - name: Install Dependencies
@@ -28,7 +31,7 @@ jobs:
         run: bin/apigen --title ApiGen src
 
       - name: Publish Pages
-        uses: JamesIves/github-pages-deploy-action@v4
+        uses: JamesIves/github-pages-deploy-action@6c2d9db
         with:
           folder: api
           branch: gh-pages
