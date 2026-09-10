@@ -30,37 +30,171 @@ class Analyzer
 
 
 	/**
+	 * Analyzes the given source files and their discovered dependencies.
+	 *
 	 * @param string[] $files indexed by []
 	 */
-	public function analyze(ProgressBar $progressBar, array $files): AnalyzeResult
+	public function analyze(
+		ProgressBar $progressBar,
+		array $files,
+	): AnalyzeResult
 	{
-		$scheduler = $this->schedulerFactory->create(AnalyzeTaskHandlerFactory::class, context: null);
-		$state = new AnalyzeState($progressBar, $scheduler);
+		$scheduler = $this->schedulerFactory->create(
+			AnalyzeTaskHandlerFactory::class,
+			context: null,
+		);
 
-		foreach ($files as $file) {
-			$this->scheduleFile($state, $file, primary: true);
-		}
+		$state = new AnalyzeState(
+			$progressBar,
+			$scheduler,
+		);
 
-		/** @var AnalyzeTask $task */
-		foreach ($scheduler->process() as $task => $result) {
-			$this->processTaskResult($result, $state);
-			$progressBar->setMessage($task->sourceFile);
-			$progressBar->advance();
-		}
+		$this->schedulePrimaryFiles(
+			$state,
+			$files,
+		);
 
-		foreach ($state->missing as $missing) {
-			$referencedBy = $state->classLikes[$missing->referencedBy->fullLower] ?? $state->functions[$missing->referencedBy->fullLower];
+		$this->processScheduledTasks(
+			$state,
+		);
 
-			if ($referencedBy->primary) {
-				$state->errors[ErrorKind::MissingSymbol->name][] = $this->createMissingSymbolError($missing, $referencedBy);
-			}
-		}
+		$this->processMissingSymbols(
+			$state,
+		);
 
-		return new AnalyzeResult($state->classLikes + $state->missing, $state->functions, $state->errors);
+		return $this->createAnalyzeResult(
+			$state,
+		);
 	}
 
 
-	protected function scheduleFile(AnalyzeState $state, string $file, bool $primary): void
+	/**
+	 * Schedules all explicitly provided source files.
+	 *
+	 * @param string[] $files indexed by []
+	 */
+	protected function schedulePrimaryFiles(
+		AnalyzeState $state,
+		array $files,
+	): void
+	{
+		foreach ($files as $file) {
+			$this->scheduleFile(
+				$state,
+				$file,
+				primary: true,
+			);
+		}
+	}
+
+
+	/**
+	 * Processes all scheduled analyzer tasks.
+	 */
+	protected function processScheduledTasks(
+		AnalyzeState $state,
+	): void
+	{
+		/** @var AnalyzeTask $task */
+		foreach (
+			$state->scheduler->process()
+			as $task => $result
+		) {
+			$this->processTaskResult(
+				$result,
+				$state,
+			);
+
+			$this->updateProgress(
+				$state,
+				$task,
+			);
+		}
+	}
+
+
+	/**
+	 * Updates the progress bar after a task has been processed.
+	 */
+	protected function updateProgress(
+		AnalyzeState $state,
+		AnalyzeTask $task,
+	): void
+	{
+		$state->progressBar->setMessage(
+			$task->sourceFile,
+		);
+
+		$state->progressBar->advance();
+	}
+
+
+	/**
+	 * Processes unresolved symbols after all scheduled tasks finish.
+	 */
+	protected function processMissingSymbols(
+		AnalyzeState $state,
+	): void
+	{
+		foreach ($state->missing as $missing) {
+			$referencedBy = $this->findReferencedBy(
+				$state,
+				$missing,
+			);
+
+			if (
+				$referencedBy === null
+				|| !$referencedBy->primary
+			) {
+				continue;
+			}
+
+			$state->errors[
+				ErrorKind::MissingSymbol->name
+			][] = $this->createMissingSymbolError(
+				$missing,
+				$referencedBy,
+			);
+		}
+	}
+
+
+	/**
+	 * Locates the symbol that references a missing dependency.
+	 */
+	protected function findReferencedBy(
+		AnalyzeState $state,
+		MissingInfo $missing,
+	): ClassLikeInfo|FunctionInfo|null
+	{
+		$name = $missing->referencedBy->fullLower;
+
+		return $state->classLikes[$name]
+			?? $state->functions[$name]
+			?? null;
+	}
+
+
+	/**
+	 * Builds the final analysis result.
+	 */
+	protected function createAnalyzeResult(
+		AnalyzeState $state,
+	): AnalyzeResult
+	{
+		return new AnalyzeResult(
+			$state->classLikes + $state->missing,
+			$state->functions,
+			$state->errors,
+		);
+	}
+
+
+	protected function scheduleFile(
+		AnalyzeState $state,
+		string $file,
+		bool $primary,
+	): void
 	{
 		$file = Helpers::realPath($file);
 
@@ -69,99 +203,263 @@ class Analyzer
 		}
 
 		$state->files[$file] = true;
-		$state->progressBar->setMaxSteps(count($state->files));
-		$state->scheduler->schedule(new AnalyzeTask($file, $primary));
+
+		$state->progressBar->setMaxSteps(
+			count($state->files),
+		);
+
+		$state->scheduler->schedule(
+			new AnalyzeTask(
+				$file,
+				$primary,
+			),
+		);
 	}
 
 
 	/**
-	 * @param  array<ClassLikeInfo | FunctionInfo | ClassLikeReferenceInfo | ErrorInfo> $result
+	 * @param array<ClassLikeInfo | FunctionInfo | ClassLikeReferenceInfo | ErrorInfo> $result
 	 */
-	protected function processTaskResult(array $result, AnalyzeState $state): void
+	protected function processTaskResult(
+		array $result,
+		AnalyzeState $state,
+	): void
 	{
 		foreach ($result as $info) {
-			match (true) {
-				$info instanceof ClassLikeReferenceInfo => $this->processClassLikeReference($state, $info),
-				$info instanceof ClassLikeInfo => $this->processClassLike($state, $info),
-				$info instanceof FunctionInfo => $this->processFunction($state, $info),
-				$info instanceof ErrorInfo => $this->processError($state, $info),
-			};
+			$this->processInfo(
+				$state,
+				$info,
+			);
 		}
 	}
 
 
-	protected function processClassLikeReference(AnalyzeState $state, ClassLikeReferenceInfo $info): void
+	/**
+	 * Dispatches a processed information object to the correct handler.
+	 */
+	protected function processInfo(
+		AnalyzeState $state,
+		ClassLikeInfo|FunctionInfo|ClassLikeReferenceInfo|ErrorInfo $info,
+	): void
 	{
-		if ($state->prevName !== null && !isset($state->classLikes[$info->fullLower]) && !isset($state->missing[$info->fullLower])) {
-			$name = new NameInfo($info->full, $info->fullLower);
-			$state->missing[$info->fullLower] = new MissingInfo($name, $state->prevName);
+		match (true) {
+			$info instanceof ClassLikeReferenceInfo =>
+				$this->processClassLikeReference(
+					$state,
+					$info,
+				),
 
-			if (($file = $this->locator->locate($info)) !== null) {
-				$this->scheduleFile($state, $file, primary: false);
-			}
-		}
+			$info instanceof ClassLikeInfo =>
+				$this->processClassLike(
+					$state,
+					$info,
+				),
+
+			$info instanceof FunctionInfo =>
+				$this->processFunction(
+					$state,
+					$info,
+				),
+
+			$info instanceof ErrorInfo =>
+				$this->processError(
+					$state,
+					$info,
+				),
+		};
 	}
 
 
-	protected function processClassLike(AnalyzeState $state, ClassLikeInfo $info): void
+	protected function processClassLikeReference(
+		AnalyzeState $state,
+		ClassLikeReferenceInfo $info,
+	): void
 	{
-		$existing = $state->classLikes[$info->name->fullLower] ?? null;
-
-		if ($existing === null || ($info->primary && !$existing->primary)) {
-			unset($state->missing[$info->name->fullLower]);
-			$state->classLikes[$info->name->fullLower] = $info;
-			$state->prevName = $info->name;
-
-		} elseif ($info->primary) {
-			$state->errors[ErrorKind::DuplicateSymbol->name][] = $this->createDuplicateSymbolError($info, $existing);
-			$state->prevName = null;
-
-		} else {
-			$state->prevName = null;
+		if ($state->prevName === null) {
+			return;
 		}
+
+		if (
+			isset($state->classLikes[$info->fullLower])
+			|| isset($state->missing[$info->fullLower])
+		) {
+			return;
+		}
+
+		$name = new NameInfo(
+			$info->full,
+			$info->fullLower,
+		);
+
+		$state->missing[$info->fullLower] =
+			new MissingInfo(
+				$name,
+				$state->prevName,
+			);
+
+		$file = $this->locator->locate($info);
+
+		if ($file === null) {
+			return;
+		}
+
+		$this->scheduleFile(
+			$state,
+			$file,
+			primary: false,
+		);
 	}
 
 
-	protected function processFunction(AnalyzeState $state, FunctionInfo $info): void
+	protected function processClassLike(
+		AnalyzeState $state,
+		ClassLikeInfo $info,
+	): void
 	{
-		$existing = $state->functions[$info->name->fullLower] ?? null;
+		$key = $info->name->fullLower;
 
-		if ($existing === null || ($info->primary && !$existing->primary)) {
-			$state->functions[$info->name->fullLower] = $info;
-			$state->prevName = $info->name;
+		$existing =
+			$state->classLikes[$key]
+			?? null;
 
-		} elseif ($info->primary) {
-			$state->errors[ErrorKind::DuplicateSymbol->name][] = $this->createDuplicateSymbolError($info, $existing);
-			$state->prevName = null;
+		if (
+			$existing === null
+			|| (
+				$info->primary
+				&& !$existing->primary
+			)
+		) {
+			unset($state->missing[$key]);
 
-		} else {
-			$state->prevName = null;
+			$state->classLikes[$key] = $info;
+
+			$state->prevName =
+				$info->name;
+
+			return;
 		}
-	}
 
+		if ($info->primary) {
+			$this->registerDuplicateSymbol(
+				$state,
+				$info,
+				$existing,
+			);
 
-	protected function processError(AnalyzeState $state, ErrorInfo $info): void
-	{
-		$state->errors[$info->kind->name][] = $info;
+			return;
+		}
+
 		$state->prevName = null;
 	}
 
 
-	protected function createMissingSymbolError(MissingInfo $dependency, ClassLikeInfo | FunctionInfo $referencedBy): ErrorInfo
+	protected function processFunction(
+		AnalyzeState $state,
+		FunctionInfo $info,
+	): void
 	{
-		return new ErrorInfo(ErrorKind::MissingSymbol, implode("\n", [
-			"Missing {$dependency->name->full}",
-			"referenced by {$referencedBy->name->full}",
-		]));
+		$key = $info->name->fullLower;
+
+		$existing =
+			$state->functions[$key]
+			?? null;
+
+		if (
+			$existing === null
+			|| (
+				$info->primary
+				&& !$existing->primary
+			)
+		) {
+			$state->functions[$key] = $info;
+
+			$state->prevName =
+				$info->name;
+
+			return;
+		}
+
+		if ($info->primary) {
+			$this->registerDuplicateSymbol(
+				$state,
+				$info,
+				$existing,
+			);
+
+			return;
+		}
+
+		$state->prevName = null;
 	}
 
 
-	protected function createDuplicateSymbolError(ClassLikeInfo | FunctionInfo $info, ClassLikeInfo | FunctionInfo $first): ErrorInfo
+	protected function registerDuplicateSymbol(
+		AnalyzeState $state,
+		ClassLikeInfo|FunctionInfo $info,
+		ClassLikeInfo|FunctionInfo $existing,
+	): void
 	{
-		return new ErrorInfo(ErrorKind::DuplicateSymbol, implode("\n", [
-			"Multiple definitions of {$info->name->full}.",
-			"The first definition was found in {$first->file} on line {$first->startLine}",
-			"and then another one was found in {$info->file} on line {$info->startLine}",
-		]));
+		$state->errors[
+			ErrorKind::DuplicateSymbol->name
+		][] = $this->createDuplicateSymbolError(
+			$info,
+			$existing,
+		);
+
+		$state->prevName = null;
+	}
+
+
+	protected function processError(
+		AnalyzeState $state,
+		ErrorInfo $info,
+	): void
+	{
+		$state->errors[
+			$info->kind->name
+		][] = $info;
+
+		$state->prevName = null;
+	}
+
+
+	protected function createMissingSymbolError(
+		MissingInfo $dependency,
+		ClassLikeInfo|FunctionInfo $referencedBy,
+	): ErrorInfo
+	{
+		$message = implode(
+			"\n",
+			[
+				"Missing {$dependency->name->full}",
+				"referenced by {$referencedBy->name->full}",
+			],
+		);
+
+		return new ErrorInfo(
+			ErrorKind::MissingSymbol,
+			$message,
+		);
+	}
+
+
+	protected function createDuplicateSymbolError(
+		ClassLikeInfo|FunctionInfo $info,
+		ClassLikeInfo|FunctionInfo $first,
+	): ErrorInfo
+	{
+		$message = implode(
+			"\n",
+			[
+				"Multiple definitions of {$info->name->full}.",
+				"The first definition was found in {$first->file} on line {$first->startLine}",
+				"and then another one was found in {$info->file} on line {$info->startLine}",
+			],
+		);
+
+		return new ErrorInfo(
+			ErrorKind::DuplicateSymbol,
+			$message,
+		);
 	}
 }
